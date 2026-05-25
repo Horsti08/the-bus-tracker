@@ -67,6 +67,18 @@ def invite_link(code: str, web_base: str = "") -> str:
     return f"bus-tracker://join/{code}"
 
 
+@app.get("/")
+def root():
+    return {
+        "app": "The Bus Tracker Community API",
+        "version": APP_VERSION,
+        "status": "online",
+        "docs": "/docs",
+        "health": "/health",
+        "info": "/app/info",
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION, "mode": "community"}
@@ -100,6 +112,7 @@ def app_version(request: Request):
         "version": APP_VERSION,
         "app": "The Bus Tracker",
         "download_url": "",
+        "changelog": "Fix Spedition/Join, UI flüssiger, Auto-Update",
         "community_api_url": base,
         "community_api_urls": [base],
     }
@@ -116,7 +129,7 @@ def join_info(invite_code: str, db: Session = Depends(get_db)):
         .first()
     )
     if not sp:
-        raise HTTPException(404, "Einladung ungültig")
+        raise HTTPException(400, "Einladung ungültig")
     return {
         "spedition": sp.name,
         "invite_code": invite_code,
@@ -244,7 +257,7 @@ def join_spedition(
         .first()
     )
     if not sp:
-        raise HTTPException(404, "Einladung ungültig")
+        raise HTTPException(400, "Einladung ungültig – Code prüfen")
     existing = (
         db.query(models.SpeditionMember)
         .filter(
@@ -267,6 +280,17 @@ def join_spedition(
         member_count=count,
         is_owner=sp.owner_id == user.id,
     )
+
+
+@app.post("/join", response_model=SpeditionResponse)
+def join_spedition_alias(
+    body: JoinSpeditionRequest,
+    request: Request,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Alias – falls /speditions/join auf altem Deploy fehlt."""
+    return join_spedition(body, request, user, db)
 
 
 @app.delete("/speditions/{spedition_id}")

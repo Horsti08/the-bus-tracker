@@ -4,15 +4,15 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['uvicorn.lifespan.on']
+hiddenimports = ['uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto', 'uvicorn.protocols', 'uvicorn.protocols.http', 'uvicorn.protocols.http.auto', 'uvicorn.lifespan', 'uvicorn.lifespan.on']
 hiddenimports += collect_submodules('server')
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['g:\\The Bus Tracker\\client\\main.py'],
-    pathex=['g:\\The Bus Tracker'],
+    ['G:\\The Bus Tracker\\client\\main.py'],
+    pathex=['G:\\The Bus Tracker'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

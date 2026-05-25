@@ -39,7 +39,7 @@ class SpeditionResponse(BaseModel):
 
 
 class JoinSpeditionRequest(BaseModel):
-    invite_code: str
+    invite_code: str = Field(min_length=4, max_length=64)
 
 
 class LiveUpdateRequest(BaseModel):

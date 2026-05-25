@@ -7,7 +7,7 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
-from client.api_client import ApiClient
+from client.api_client import ApiClient, format_api_error
 from client.auto_auth import ensure_authenticated
 from client.bootstrap import initialize_client
 from client.config import load_config, save_config
@@ -17,8 +17,11 @@ from client.telemetry.tracker import TripTracker
 from client.updater import check_for_update, download_and_apply
 from shared import APP_VERSION, DEFAULT_TELEMETRY_HOST, DEFAULT_TELEMETRY_PORT
 
-POLL_MS = 400
-LIVE_SYNC_EVERY = 4
+POLL_MS = 500
+LIVE_SYNC_EVERY = 6
+UI_REFRESH_EVERY = 8
+LIVE_AUTO_MS = 5000
+AUTO_UPDATE_MS = 30 * 60 * 1000
 
 
 class BusTrackerApp(ctk.CTk):
@@ -36,6 +39,10 @@ class BusTrackerApp(ctk.CTk):
         self._active_spedition_id = self.config_data.get("active_spedition_id")
         self._last_snap = None
         self._server_info: ServerInfo | None = None
+        self._current_tab = "loading"
+        self._live_busy = False
+        self._live_job: str | None = None
+        self._update_job: str | None = None
 
         self._build_shell()
         self._show_tab("loading")
@@ -78,7 +85,11 @@ class BusTrackerApp(ctk.CTk):
         self.sidebar = ctk.CTkFrame(body, width=190, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.lbl_user = ctk.CTkLabel(self.sidebar, text="", text_color="gray", wraplength=160)
-        self.lbl_user.pack(pady=(16, 8), padx=12)
+        self.lbl_user.pack(pady=(16, 4), padx=12)
+        self.lbl_status = ctk.CTkLabel(
+            self.sidebar, text="", text_color="gray", wraplength=160, font=ctk.CTkFont(size=11)
+        )
+        self.lbl_status.pack(pady=(0, 8), padx=12)
 
         for name, cmd in [
             ("Dashboard", lambda: self._show_tab("dashboard")),
@@ -92,10 +103,10 @@ class BusTrackerApp(ctk.CTk):
 
         ctk.CTkButton(
             self.sidebar,
-            text="Update prüfen",
+            text="Update jetzt prüfen",
             fg_color="gray30",
             command=self._check_update_manual,
-        ).pack(side="bottom", fill="x", padx=12, pady=16)
+        ).pack(side="bottom", fill="x", padx=12, pady=(4, 16))
 
         self.main = ctk.CTkFrame(body, corner_radius=0)
         self.main.grid(row=0, column=1, sticky="nsew")
@@ -152,6 +163,7 @@ class BusTrackerApp(ctk.CTk):
             self.lbl_user.configure(text="👤 Gast (offline)")
         self._show_tab("dashboard")
         self.after(POLL_MS, self._poll_loop)
+        self._schedule_auto_update()
 
     def _on_community_failed(self, err: str):
         self.lbl_server.configure(text="Server: nicht erreichbar", text_color="#E74C3C")
@@ -207,10 +219,36 @@ class BusTrackerApp(ctk.CTk):
         self.lbl_server.configure(text="Server: Fehler", text_color="#E74C3C")
         messagebox.showerror("Verbindung", f"Fehler:\n{err}")
 
+    def _toast(self, msg: str, color: str = "#AAAAAA"):
+        self.lbl_status.configure(text=msg[:120], text_color=color)
+
+    def _run_bg(self, work, on_ok=None, on_err=None):
+        def runner():
+            try:
+                result = work()
+                if on_ok:
+                    self.after(0, lambda: on_ok(result))
+            except Exception as e:
+                if on_err:
+                    self.after(0, lambda: on_err(e))
+                else:
+                    self.after(0, lambda: self._toast(format_api_error(e), "#E74C3C"))
+
+        threading.Thread(target=runner, daemon=True).start()
+
     def _show_tab(self, name: str):
+        self._current_tab = name
         for key, frame in self.tabs.items():
             frame.grid_remove()
         self.tabs[name].grid(row=0, column=0, sticky="nsew")
+        if name == "live":
+            self._schedule_live_auto()
+        elif self._live_job:
+            try:
+                self.after_cancel(self._live_job)
+            except Exception:
+                pass
+            self._live_job = None
 
     def _build_loading_tab(self):
         f = self.tabs["loading"]
@@ -273,6 +311,8 @@ class BusTrackerApp(ctk.CTk):
         ctk.CTkButton(row, text="Aktualisieren", width=100, command=self._refresh_speditions).pack(
             side="right", padx=8
         )
+        if self._active_spedition_id:
+            self.after(500, self._update_stats, self._active_spedition_id)
         create = ctk.CTkFrame(f)
         create.grid(row=1, column=0, sticky="ew", padx=16, pady=4)
         self.sped_name = ctk.CTkEntry(create, placeholder_text="Name", width=180)
@@ -292,9 +332,13 @@ class BusTrackerApp(ctk.CTk):
         ctk.CTkLabel(
             f, text="Live – Wer fährt wo?", font=ctk.CTkFont(size=18, weight="bold")
         ).pack(pady=12, anchor="w", padx=16)
-        self.live_scroll = ctk.CTkScrollableFrame(f)
-        self.live_scroll.pack(fill="both", expand=True, padx=16, pady=8)
-        ctk.CTkButton(f, text="Aktualisieren", command=self._refresh_live).pack(pady=8)
+        self.live_text = ctk.CTkTextbox(f, height=400, font=ctk.CTkFont(size=13))
+        self.live_text.pack(fill="both", expand=True, padx=16, pady=8)
+        self.live_text.insert("1.0", "Wähle eine aktive Spedition (Tab Spedition → Aktiv).\n")
+        self.live_text.configure(state="disabled")
+        ctk.CTkLabel(
+            f, text="Aktualisiert automatisch alle 5 Sekunden", text_color="gray"
+        ).pack(pady=(0, 4))
 
     def _build_account_tab(self):
         f = self.tabs["account"]
@@ -323,19 +367,41 @@ class BusTrackerApp(ctk.CTk):
             anchor="w", pady=8
         )
 
+    def _schedule_auto_update(self):
+        def check():
+            url = self.api.base_url if self.api else None
+            upd = check_for_update(url)
+            if upd and upd.get("download_url") and getattr(__import__("sys"), "frozen", False):
+                self._toast(f"Update {upd['version']} verfügbar – Sidebar", "#5DADE2")
+            elif upd:
+                self._toast(f"Neue Version {upd.get('version')} auf Server", "#5DADE2")
+
+        self._run_bg(lambda: check())
+        if self._update_job:
+            try:
+                self.after_cancel(self._update_job)
+            except Exception:
+                pass
+        self._update_job = self.after(AUTO_UPDATE_MS, self._schedule_auto_update)
+
     def _check_update_manual(self):
-        upd = check_for_update()
-        if not upd:
-            messagebox.showinfo("Update", f"Du hast die neueste Version ({APP_VERSION}).")
-            return
-        if upd.get("download_url") and getattr(__import__("sys"), "frozen", False):
-            if messagebox.askyesno("Update", f"Version {upd['version']} installieren?"):
-                download_and_apply(upd, self)
-        else:
-            messagebox.showinfo(
-                "Update",
-                f"Neue Version: {upd.get('version')}\n{upd.get('changelog', '')}",
-            )
+        url = self.api.base_url if self.api else None
+        self._toast("Suche Update…", "gray")
+
+        def work():
+            return check_for_update(url)
+
+        def ok(upd):
+            if not upd:
+                self._toast(f"Aktuell: v{APP_VERSION}", "#2ECC71")
+                return
+            if upd.get("download_url") and getattr(__import__("sys"), "frozen", False):
+                if messagebox.askyesno("Update", f"Version {upd['version']} installieren?"):
+                    download_and_apply(upd, self)
+            else:
+                self._toast(f"Neu: v{upd.get('version')} (kein Download-Link)", "#F39C12")
+
+        self._run_bg(work, on_ok=ok)
 
     def _save_display(self):
         name = self.acc_display.get().strip()
@@ -363,64 +429,85 @@ class BusTrackerApp(ctk.CTk):
     def _create_spedition(self):
         if not self.api or not self.api.token:
             return
-        try:
-            self.api.create_spedition(self.sped_name.get().strip())
-            self._refresh_speditions()
-            messagebox.showinfo("OK", "Spedition erstellt – Link kopieren und teilen!")
-        except Exception as e:
-            messagebox.showerror("Fehler", str(e))
+        name = self.sped_name.get().strip()
+        if len(name) < 2:
+            self._toast("Name mindestens 2 Zeichen", "#E74C3C")
+            return
+        self._toast("Erstelle Spedition…", "gray")
+        self._run_bg(
+            lambda: self.api.create_spedition(name),
+            on_ok=lambda _: (self._refresh_speditions(), self._toast("Spedition erstellt!", "#2ECC71")),
+        )
 
     def _join_spedition(self):
         code = self.invite_entry.get().strip()
         if code.startswith("bus-tracker://join/"):
             code = code.split("/")[-1]
-        try:
-            self.api.join_spedition(code)
-            self._refresh_speditions()
-            messagebox.showinfo("OK", "Beigetreten!")
-        except Exception as e:
-            messagebox.showerror("Fehler", str(e))
+        if "join/" in code and "http" in code:
+            code = code.rstrip("/").split("/")[-1]
+        if len(code) < 4:
+            self._toast("Einladungscode eingeben (aus Link)", "#E74C3C")
+            return
+        self._toast("Beitrete…", "gray")
+        self._run_bg(
+            lambda: self.api.join_spedition(code),
+            on_ok=lambda _: (self._refresh_speditions(), self._toast("Beigetreten!", "#2ECC71")),
+        )
 
     def _refresh_speditions(self):
         if not self.api or not self.api.token:
             return
-        for w in self.sped_list.winfo_children():
-            w.destroy()
-        try:
-            speditions = self.api.list_speditions()
-        except Exception:
-            return
-        for sp in speditions:
-            row = ctk.CTkFrame(self.sped_list)
-            row.pack(fill="x", pady=6, padx=4)
-            ctk.CTkLabel(row, text=f"{sp['name']} ({sp['member_count']})").pack(
-                side="left", padx=8
+
+        def work():
+            return self.api.list_speditions()
+
+        def ok(speditions):
+            for w in self.sped_list.winfo_children():
+                w.destroy()
+            if not speditions:
+                ctk.CTkLabel(self.sped_list, text="Noch keine Spedition – oben gründen").pack(pady=12)
+                return
+            for sp in speditions:
+                self._add_spedition_row(sp)
+
+        self._run_bg(work, on_ok=ok)
+
+    def _add_spedition_row(self, sp):
+        row = ctk.CTkFrame(self.sped_list)
+        row.pack(fill="x", pady=6, padx=4)
+        ctk.CTkLabel(row, text=f"{sp['name']} ({sp['member_count']})").pack(
+            side="left", padx=8
+        )
+
+        def select(s=sp):
+            self._active_spedition_id = s["id"]
+            self.config_data["active_spedition_id"] = s["id"]
+            save_config(self.config_data)
+            self._update_stats(s["id"])
+            self._toast(f"Aktiv: {s['name']}", "#2ECC71")
+            if self._current_tab == "live":
+                self._refresh_live_async()
+
+        ctk.CTkButton(row, text="Aktiv", width=50, command=select).pack(side="right", padx=4)
+
+        def copy_link(s=sp):
+            self.clipboard_clear()
+            self.clipboard_append(s["invite_link"])
+            self._toast("Link kopiert!", "#2ECC71")
+
+        ctk.CTkButton(row, text="Link", width=44, command=copy_link).pack(side="right", padx=4)
+        if sp["is_owner"]:
+
+            def delete(s=sp):
+                if messagebox.askyesno("Löschen", f"'{s['name']}' löschen?"):
+                    self._run_bg(
+                        lambda: self.api.delete_spedition(s["id"]),
+                        on_ok=lambda _: self._refresh_speditions(),
+                    )
+
+            ctk.CTkButton(row, text="✕", width=36, fg_color="#8B0000", command=delete).pack(
+                side="right", padx=4
             )
-
-            def select(s=sp):
-                self._active_spedition_id = s["id"]
-                self.config_data["active_spedition_id"] = s["id"]
-                save_config(self.config_data)
-                self._update_stats(s["id"])
-
-            ctk.CTkButton(row, text="Aktiv", width=50, command=select).pack(side="right", padx=4)
-
-            def copy_link(s=sp):
-                self.clipboard_clear()
-                self.clipboard_append(s["invite_link"])
-                messagebox.showinfo("Link kopiert", s["invite_link"])
-
-            ctk.CTkButton(row, text="Link", width=44, command=copy_link).pack(side="right", padx=4)
-            if sp["is_owner"]:
-
-                def delete(s=sp):
-                    if messagebox.askyesno("Löschen", f"'{s['name']}' löschen?"):
-                        self.api.delete_spedition(s["id"])
-                        self._refresh_speditions()
-
-                ctk.CTkButton(row, text="✕", width=36, fg_color="#8B0000", command=delete).pack(
-                    side="right", padx=4
-                )
 
     def _update_stats(self, spedition_id: int):
         try:
@@ -434,36 +521,52 @@ class BusTrackerApp(ctk.CTk):
         except Exception:
             pass
 
-    def _refresh_live(self):
-        if not self._active_spedition_id or not self.api:
+    def _schedule_live_auto(self):
+        if self._live_job:
+            try:
+                self.after_cancel(self._live_job)
+            except Exception:
+                pass
+        self._refresh_live_async()
+        self._live_job = self.after(LIVE_AUTO_MS, self._schedule_live_auto)
+
+    def _refresh_live_async(self):
+        if self._live_busy or not self._active_spedition_id or not self.api:
+            if not self._active_spedition_id:
+                self._set_live_text("Keine aktive Spedition.\nTab Spedition → Aktiv wählen.")
             return
-        for w in self.live_scroll.winfo_children():
-            w.destroy()
-        try:
-            drivers = self.api.get_live_drivers(self._active_spedition_id)
-        except Exception as e:
-            ctk.CTkLabel(self.live_scroll, text=str(e)).pack()
-            return
-        if not drivers:
-            ctk.CTkLabel(self.live_scroll, text="Niemand online.").pack(pady=20)
-            return
-        for d in drivers:
-            card = ctk.CTkFrame(self.live_scroll)
-            card.pack(fill="x", pady=6, padx=4)
-            col = "#FF6B6B" if d["is_overspeed"] else "#2ECC71"
-            ctk.CTkLabel(
-                card,
-                text=f"{d['display_name']}  •  {d['speed_kmh']:.0f} km/h",
-                font=ctk.CTkFont(size=15, weight="bold"),
-                text_color=col,
-            ).pack(anchor="w", padx=12, pady=4)
-            txt = (
-                f"Server/Karte: {d.get('level_name') or '–'}\n"
-                f"Bus: {d['vehicle_model'] or '–'}  |  Linie: {d['line_name'] or '–'}\n"
-                f"{d['current_stop'] or '–'} → {d['next_stop'] or '–'}\n"
-                f"Umsatz Session: {d['revenue_session_eur']:.2f} €"
-            )
-            ctk.CTkLabel(card, text=txt, justify="left").pack(anchor="w", padx=12, pady=4)
+        self._live_busy = True
+        sid = self._active_spedition_id
+
+        def work():
+            return self.api.get_live_drivers(sid)
+
+        def ok(drivers):
+            self._live_busy = False
+            lines = []
+            if not drivers:
+                lines.append("Niemand online – warte auf Fahrer…")
+            for d in drivers:
+                flag = " ⚠" if d.get("is_overspeed") else ""
+                lines.append(
+                    f"{d['display_name']}  •  {d['speed_kmh']:.0f} km/h{flag}\n"
+                    f"  Karte: {d.get('level_name') or '–'} | Linie: {d.get('line_name') or '–'}\n"
+                    f"  {d.get('current_stop') or '–'} → {d.get('next_stop') or '–'}\n"
+                    f"  Umsatz: {d.get('revenue_session_eur', 0):.2f} €\n"
+                )
+            self._set_live_text("\n".join(lines))
+
+        def err(e):
+            self._live_busy = False
+            self._set_live_text(format_api_error(e))
+
+        self._run_bg(work, on_ok=ok, on_err=err)
+
+    def _set_live_text(self, text: str):
+        self.live_text.configure(state="normal")
+        self.live_text.delete("1.0", "end")
+        self.live_text.insert("1.0", text)
+        self.live_text.configure(state="disabled")
 
     def _end_trip_manual(self):
         ended = self.tracker.force_end()
@@ -502,7 +605,7 @@ class BusTrackerApp(ctk.CTk):
             self.lbl_telemetry.configure(text=tel_text, text_color=tel_color)
             self.lbl_game_map.configure(text=f"Karte: {map_name}")
 
-            if snap.connected:
+            if snap.connected and self._tick_count % UI_REFRESH_EVERY == 0:
                 overspeed = (
                     snap.allowed_speed_kmh > 0
                     and snap.speed_kmh > snap.allowed_speed_kmh + 3
@@ -516,18 +619,16 @@ class BusTrackerApp(ctk.CTk):
                 )
                 self.dash_cards["tix_val"].configure(text=str(trip.tickets_sold))
                 self.dash_cards["dist_val"].configure(text=f"{trip.distance_km:.2f} km")
-                self.dash_info.delete("1.0", "end")
-                self.dash_info.insert(
-                    "1.0",
+                info = (
                     f"Fahrzeug: {snap.vehicle_model}\n"
                     f"Linie: {snap.line_name or '–'} | Route: {snap.route_name or '–'}\n"
-                    f"Karte/Server: {snap.level_name or '–'}\n"
+                    f"Karte: {snap.level_name or '–'}\n"
                     f"Haltestelle: {snap.current_stop or '–'} → {snap.next_stop or '–'}\n"
                     f"Belegung: {snap.num_occupied_seats}/{snap.num_seats}\n"
-                    f"Fahrt: {'aktiv' if trip.active else 'pausiert'} | "
-                    f"Max {trip.max_speed_kmh:.0f} km/h\n"
-                    f"Tracker-Server: {self._server_info.label if self._server_info else '–'}\n",
+                    f"Fahrt: {'aktiv' if trip.active else 'pausiert'} | Max {trip.max_speed_kmh:.0f} km/h\n"
                 )
+                self.dash_info.delete("1.0", "end")
+                self.dash_info.insert("1.0", info)
 
             if (
                 not trip.active
@@ -542,10 +643,9 @@ class BusTrackerApp(ctk.CTk):
 
             self._tick_count += 1
             if self.api and self.api.token and self._tick_count % LIVE_SYNC_EVERY == 0:
-                self._sync_live(snap)
-
-            if self._tick_count % (LIVE_SYNC_EVERY * 3) == 0 and self.tabs["live"].winfo_ismapped():
-                self._refresh_live()
+                threading.Thread(
+                    target=lambda: self._sync_live(snap), daemon=True
+                ).start()
 
         except Exception:
             pass
@@ -576,6 +676,12 @@ class BusTrackerApp(ctk.CTk):
 
     def destroy(self):
         self._running = False
+        for job in (self._live_job, self._update_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
         self.telemetry.close()
         if self.api:
             self.api.close()

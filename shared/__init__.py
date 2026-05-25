@@ -1,6 +1,6 @@
 # Shared constants – SPEDV-Modell: zentraler Community-API-Server im Internet
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_NAME = "The Bus Tracker"
 COMMUNITY_SERVER_NAME = "The Bus Tracker Community"
 

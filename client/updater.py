@@ -1,4 +1,4 @@
-"""Auto-Updater – prüft beim Start auf neue Version."""
+"""Auto-Updater – Community-Server + GitHub-Manifest."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from pathlib import Path
 
 import httpx
 
-from shared import APP_VERSION, UPDATE_MANIFEST_URL
+from shared import APP_VERSION, COMMUNITY_API_ENDPOINTS, UPDATE_MANIFEST_URL
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
     parts = []
-    for p in v.strip().lstrip("v").split("."):
+    for p in str(v).strip().lstrip("v").split("."):
         try:
             parts.append(int(p))
         except ValueError:
@@ -23,33 +23,36 @@ def _parse_version(v: str) -> tuple[int, ...]:
     return tuple(parts) if parts else (0,)
 
 
-def check_for_update() -> dict | None:
+def check_for_update(community_url: str | None = None) -> dict | None:
+    sources: list[str] = []
+    if community_url:
+        sources.append(community_url.rstrip("/"))
+    for u in COMMUNITY_API_ENDPOINTS:
+        if u not in sources:
+            sources.append(u.rstrip("/"))
+
+    for base in sources:
+        try:
+            r = httpx.get(f"{base}/app/version", timeout=6.0)
+            if r.status_code == 200:
+                data = r.json()
+                remote = data.get("version", "")
+                if remote and _parse_version(remote) > _parse_version(APP_VERSION):
+                    data.setdefault("download_url", data.get("download_url", ""))
+                    return data
+        except httpx.HTTPError:
+            continue
+
     try:
         r = httpx.get(UPDATE_MANIFEST_URL, timeout=8.0)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        remote = data.get("version", "")
-        if _parse_version(remote) > _parse_version(APP_VERSION):
-            return data
+        if r.status_code == 200:
+            data = r.json()
+            remote = data.get("version", "")
+            if _parse_version(remote) > _parse_version(APP_VERSION):
+                return data
     except httpx.HTTPError:
         pass
     return None
-
-
-def _write_updater_script(new_exe: Path, target: Path) -> Path:
-    script = Path(tempfile.gettempdir()) / "but_update.bat"
-    script.write_text(
-        f"""@echo off
-timeout /t 2 /nobreak >nul
-copy /Y "{new_exe}" "{target}"
-start "" "{target}"
-del "{new_exe}"
-del "%~f0"
-""",
-        encoding="utf-8",
-    )
-    return script
 
 
 def download_and_apply(update: dict, parent_window=None) -> bool:
@@ -57,11 +60,10 @@ def download_and_apply(update: dict, parent_window=None) -> bool:
     if not url:
         return False
 
-    if getattr(sys, "frozen", False):
-        target = Path(sys.executable)
-    else:
+    if not getattr(sys, "frozen", False):
         return False
 
+    target = Path(sys.executable)
     try:
         with httpx.stream("GET", url, timeout=120.0, follow_redirects=True) as resp:
             resp.raise_for_status()
@@ -72,7 +74,17 @@ def download_and_apply(update: dict, parent_window=None) -> bool:
     except httpx.HTTPError:
         return False
 
-    script = _write_updater_script(tmp, target)
+    script = Path(tempfile.gettempdir()) / "but_update.bat"
+    script.write_text(
+        f"""@echo off
+timeout /t 2 /nobreak >nul
+copy /Y "{tmp}" "{target}"
+start "" "{target}"
+del "{tmp}"
+del "%~f0"
+""",
+        encoding="utf-8",
+    )
     subprocess.Popen(["cmd", "/c", str(script)], creationflags=subprocess.CREATE_NO_WINDOW)
     if parent_window:
         try:
@@ -80,7 +92,3 @@ def download_and_apply(update: dict, parent_window=None) -> bool:
         except Exception:
             pass
     sys.exit(0)
-
-
-def prompt_update_if_available(root=None) -> dict | None:
-    return check_for_update()
