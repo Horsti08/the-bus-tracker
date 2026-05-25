@@ -50,6 +50,23 @@ if (-not (Test-Path $GitExe)) {
 $env:PATH = "$(Split-Path $GitExe -Parent);$env:PATH"
 $git = $GitExe
 
+function Run-Git {
+    param(
+        [Parameter(Mandatory, ValueFromRemainingArguments = $true)]
+        [string[]]$GitCommand,
+        [switch]$Optional
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $git @GitCommand 2>&1 | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if (-not $Optional -and $code -ne 0) {
+        throw "Git fehlgeschlagen (Exit $code): git $($GitCommand -join ' ')"
+    }
+    return $code
+}
+
 # Repo-URL mit Token (nicht in Logs speichern)
 $repoWithAuth = "https://${Token}@github.com/Horsti08/the-bus-tracker.git"
 
@@ -70,31 +87,36 @@ the-bus-tracker-github.zip
 "@ | Set-Content -Path ".gitignore" -Encoding UTF8
 }
 
-& $git init
-& $git config user.email "horsti08@users.noreply.github.com"
-& $git config user.name "Horsti08"
+Run-Git init
+Run-Git config user.email "horsti08@users.noreply.github.com"
+Run-Git config user.name "Horsti08"
 
-& $git add -A
-& $git status --short | Select-Object -First 20
+Run-Git add -A
+& $git status --short | Select-Object -First 25
 
-$status = & $git status --porcelain
+$ErrorActionPreference = "Continue"
+$status = & $git status --porcelain 2>&1
+$ErrorActionPreference = "Stop"
+
 if (-not $status) {
-    Write-Host "Nichts zu committen (evtl. schon aktuell)." -ForegroundColor Yellow
+    Write-Host "Nichts Neues zu committen." -ForegroundColor Yellow
 } else {
-    & $git commit -m "The Bus Tracker v1.2.0 - Community API, Telemetry, EXE"
+    Run-Git commit -m "The Bus Tracker v1.2.0 - Community API, Telemetry, EXE"
 }
 
-& $git branch -M $Branch 2>$null
+Run-Git branch -M $Branch -Optional
 
-# Remote setzen
-& $git remote remove origin 2>$null
-& $git remote add origin $repoWithAuth
+# Remote setzen (remove ist OK wenn origin noch nicht existiert)
+Run-Git remote remove origin -Optional
+if ((Run-Git remote add origin $repoWithAuth -Optional) -ne 0) {
+    Run-Git remote set-url origin $repoWithAuth
+}
 
 Write-Host "Push nach GitHub..." -ForegroundColor Cyan
-& $git push -u origin $Branch --force
+Run-Git push -u origin $Branch --force
 
 # Token aus Remote entfernen (Sicherheit)
-& $git remote set-url origin $Repo
+Run-Git remote set-url origin $Repo
 
 Write-Host ""
 Write-Host "FERTIG! Code ist auf GitHub:" -ForegroundColor Green
