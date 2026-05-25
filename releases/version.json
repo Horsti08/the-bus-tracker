@@ -1,0 +1,10 @@
+{
+  "version": "1.2.0",
+  "mandatory": false,
+  "changelog": "SPEDV-Modell: zentraler Internet-Community-Server, kein WLAN noetig",
+  "download_url": "",
+  "community_api_url": "https://the-bus-tracker-api.onrender.com",
+  "community_api_urls": [
+    "https://the-bus-tracker-api.onrender.com"
+  ]
+}

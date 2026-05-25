@@ -1,0 +1,11 @@
+dist/
+build/
+*.pyc
+__pycache__/
+.git/
+data/
+client/
+tools/
+agent-tools/
+*.md
+!deploy/

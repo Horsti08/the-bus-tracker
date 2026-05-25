@@ -1,0 +1,19 @@
+# Render.com – einmal deployen = Community-Server für alle (wie SPEDV)
+# Dashboard: New → Blueprint → dieses Repo
+services:
+  - type: web
+    name: the-bus-tracker-api
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: ..
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DATABASE_DIR
+        value: /var/data
+    disk:
+      name: bus-tracker-data
+      mountPath: /var/data
+      sizeGB: 1

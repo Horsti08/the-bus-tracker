@@ -1,0 +1,9 @@
+﻿dist/
+build/
+data/
+__pycache__/
+*.pyc
+.env
+*.db
+agent-tools/
+the-bus-tracker-github.zip
