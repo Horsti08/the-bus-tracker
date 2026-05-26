@@ -1,8 +1,6 @@
-# Nach .\build.ps1: EXE veröffentlichen + Auto-Update aktivieren
-#
-# 1) Lade dist\TheBusTracker.exe hoch (GitHub Release, Google Drive, eigener Server)
-# 2) Trage die oeffentliche URL unten ein
-# 3) Dieses Skript aktualisiert releases\version.json (dann GitHub pushen)
+# Nach GitHub Release: download_url in releases/version.json eintragen
+# Beispiel:
+#   .\scripts\publish_update.ps1 -DownloadUrl "https://github.com/Horsti08/the-bus-tracker/releases/download/v1.3.1/TheBusTracker.exe"
 
 param(
     [Parameter(Mandatory = $true)]
@@ -11,13 +9,16 @@ param(
     [string]$Changelog = "Bugfixes und Verbesserungen"
 )
 
+$ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
+
 if (-not $Version) {
-    $shared = Get-Content (Join-Path $Root "shared\__init__.py") -Raw
+    $sharedPath = Join-Path $Root "shared\__init__.py"
+    $shared = Get-Content $sharedPath -Raw
     if ($shared -match 'APP_VERSION = "([^"]+)"') {
         $Version = $Matches[1]
     } else {
-        $Version = "1.0.0"
+        $Version = "1.3.1"
     }
 }
 
@@ -34,12 +35,9 @@ $path = Join-Path $Root "releases\version.json"
 $manifest | Set-Content -Path $path -Encoding UTF8
 
 Write-Host ""
-Write-Host "releases\version.json aktualisiert:" -ForegroundColor Green
+Write-Host "OK: releases\version.json aktualisiert" -ForegroundColor Green
 Write-Host $manifest
 Write-Host ""
-Write-Host "Naechster Schritt – auf GitHub pushen:" -ForegroundColor Yellow
-Write-Host '  $env:GITHUB_TOKEN = "DEIN_TOKEN"'
-Write-Host '  cd "G:\The Bus Tracker"'
-Write-Host '  .\scripts\upload_to_github.ps1'
+Write-Host "Jetzt noch ausfuehren:" -ForegroundColor Yellow
+Write-Host '  .\scripts\upload_to_github.ps1' -ForegroundColor White
 Write-Host ""
-Write-Host "Alle EXEs pruefen dann beim Start / alle 30 Min auf Updates." -ForegroundColor Cyan
