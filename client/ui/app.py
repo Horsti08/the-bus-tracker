@@ -8,6 +8,20 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from client.api_client import ApiClient, format_api_error
+from client.ui.cards import MenuCard
+from client.ui.map_canvas import LiveMapCanvas
+from client.ui.theme import (
+    ACCENT_BLUE,
+    ACCENT_GREEN,
+    ACCENT_ORANGE,
+    ACCENT_PURPLE,
+    ACCENT_YELLOW,
+    BG_CARD,
+    BG_DARK,
+    BG_HEADER,
+    TEXT,
+    TEXT_DIM,
+)
 from client.auto_auth import ensure_authenticated
 from client.bootstrap import initialize_client
 from client.config import load_config, save_config
@@ -17,10 +31,10 @@ from client.telemetry.tracker import TripTracker
 from client.updater import check_for_update, download_and_apply
 from shared import APP_VERSION, DEFAULT_TELEMETRY_HOST, DEFAULT_TELEMETRY_PORT
 
-POLL_MS = 500
-LIVE_SYNC_EVERY = 6
-UI_REFRESH_EVERY = 8
-LIVE_AUTO_MS = 5000
+POLL_MS = 400
+LIVE_SYNC_EVERY = 5
+UI_REFRESH_EVERY = 10
+LIVE_AUTO_MS = 2000
 AUTO_UPDATE_MS = 30 * 60 * 1000
 
 
@@ -28,10 +42,11 @@ class BusTrackerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"The Bus Tracker v{APP_VERSION}")
-        self.geometry("1150x740")
-        self.minsize(920, 620)
+        self.geometry("1280x800")
+        self.minsize(1000, 680)
+        self.configure(fg_color=BG_DARK)
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
+        ctk.set_default_color_theme("dark-blue")
 
         self.config_data = load_config()
         self._running = True
@@ -43,6 +58,9 @@ class BusTrackerApp(ctk.CTk):
         self._live_busy = False
         self._live_job: str | None = None
         self._update_job: str | None = None
+        self._sped_refresh_job: str | None = None
+        self._cached_dash_info = ""
+        self._bank_cache: dict | None = None
 
         self._build_shell()
         self._show_tab("loading")
@@ -52,79 +70,88 @@ class BusTrackerApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        self.topbar = ctk.CTkFrame(self, height=56, corner_radius=0)
+        self.topbar = ctk.CTkFrame(self, height=52, corner_radius=0, fg_color=BG_HEADER)
         self.topbar.grid(row=0, column=0, sticky="ew")
         self.topbar.grid_columnconfigure(1, weight=1)
 
+        ctk.CTkButton(
+            self.topbar,
+            text="☰ Hauptmenü",
+            width=120,
+            fg_color="transparent",
+            hover_color=BG_CARD,
+            command=lambda: self._show_tab("menu"),
+        ).grid(row=0, column=0, padx=12, pady=8, sticky="w")
+
         ctk.CTkLabel(
             self.topbar,
-            text=f"🚌 The Bus Tracker  v{APP_VERSION}",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        ).grid(row=0, column=0, padx=16, pady=10, sticky="w")
+            text="The Bus Tracker",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color=TEXT,
+        ).grid(row=0, column=1, padx=8, sticky="w")
+
+        self.lbl_version = ctk.CTkLabel(
+            self.topbar,
+            text=f"v{APP_VERSION}",
+            text_color=ACCENT_GREEN,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.lbl_version.grid(row=0, column=2, padx=8, sticky="e")
 
         self.lbl_server = ctk.CTkLabel(
-            self.topbar, text="Server: …", font=ctk.CTkFont(size=13)
+            self.topbar, text="Server: …", font=ctk.CTkFont(size=12), text_color=TEXT_DIM
         )
-        self.lbl_server.grid(row=0, column=1, padx=8, sticky="e")
+        self.lbl_server.grid(row=0, column=3, padx=8, sticky="e")
 
         self.lbl_game_map = ctk.CTkLabel(
-            self.topbar, text="Karte: –", text_color="gray", font=ctk.CTkFont(size=13)
+            self.topbar, text="Karte: –", text_color=TEXT_DIM, font=ctk.CTkFont(size=12)
         )
-        self.lbl_game_map.grid(row=0, column=2, padx=8, sticky="e")
+        self.lbl_game_map.grid(row=0, column=4, padx=8, sticky="e")
 
         self.lbl_telemetry = ctk.CTkLabel(
-            self.topbar, text="The Bus: …", font=ctk.CTkFont(size=13)
+            self.topbar, text="The Bus: …", font=ctk.CTkFont(size=12)
         )
-        self.lbl_telemetry.grid(row=0, column=3, padx=16, sticky="e")
+        self.lbl_telemetry.grid(row=0, column=5, padx=16, sticky="e")
 
-        body = ctk.CTkFrame(self, corner_radius=0)
-        body.grid(row=1, column=0, sticky="nsew")
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
-
-        self.sidebar = ctk.CTkFrame(body, width=190, corner_radius=0)
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.lbl_user = ctk.CTkLabel(self.sidebar, text="", text_color="gray", wraplength=160)
-        self.lbl_user.pack(pady=(16, 4), padx=12)
-        self.lbl_status = ctk.CTkLabel(
-            self.sidebar, text="", text_color="gray", wraplength=160, font=ctk.CTkFont(size=11)
-        )
-        self.lbl_status.pack(pady=(0, 8), padx=12)
-
-        for name, cmd in [
-            ("Dashboard", lambda: self._show_tab("dashboard")),
-            ("Spedition", lambda: self._show_tab("spedition")),
-            ("Live-Karte", lambda: self._show_tab("live")),
-            ("Konto", lambda: self._show_tab("account")),
-        ]:
-            ctk.CTkButton(self.sidebar, text=name, command=cmd, anchor="w").pack(
-                fill="x", padx=12, pady=4
-            )
-
-        ctk.CTkButton(
-            self.sidebar,
-            text="Update jetzt prüfen",
-            fg_color="gray30",
-            command=self._check_update_manual,
-        ).pack(side="bottom", fill="x", padx=12, pady=(4, 16))
-
-        self.main = ctk.CTkFrame(body, corner_radius=0)
-        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main = ctk.CTkFrame(self, corner_radius=0, fg_color=BG_DARK)
+        self.main.grid(row=1, column=0, sticky="nsew")
         self.main.grid_columnconfigure(0, weight=1)
         self.main.grid_rowconfigure(0, weight=1)
 
+        self.lbl_user = ctk.CTkLabel(self, text="", text_color=TEXT_DIM)
+        self.lbl_status = ctk.CTkLabel(
+            self, text="", text_color=TEXT_DIM, font=ctk.CTkFont(size=10)
+        )
+
         self.tabs: dict[str, ctk.CTkFrame] = {}
-        for key in ("loading", "dashboard", "spedition", "live", "account"):
-            f = ctk.CTkFrame(self.main)
+        for key in (
+            "loading",
+            "menu",
+            "dashboard",
+            "spedition",
+            "live",
+            "ranking",
+            "bank",
+            "account",
+        ):
+            f = ctk.CTkFrame(self.main, fg_color=BG_DARK)
             f.grid(row=0, column=0, sticky="nsew")
             self.tabs[key] = f
 
         self._build_loading_tab()
+        self._build_menu_tab()
         self._build_dashboard_tab()
         self._build_spedition_tab()
         self._build_live_tab()
+        self._build_ranking_tab()
+        self._build_bank_tab()
         self._build_account_tab()
         self._show_tab("loading")
+
+        foot = ctk.CTkFrame(self, height=28, fg_color=BG_HEADER, corner_radius=0)
+        foot.grid(row=2, column=0, sticky="ew")
+        self.lbl_user.pack(in_=foot, side="left", padx=12)
+        self.lbl_status.pack(in_=foot, side="right", padx=12)
 
         self.telemetry = TelemetryClient(
             TelemetryConfig(host=DEFAULT_TELEMETRY_HOST, port=DEFAULT_TELEMETRY_PORT)
@@ -161,7 +188,7 @@ class BusTrackerApp(ctk.CTk):
             self._refresh_speditions()
         else:
             self.lbl_user.configure(text="👤 Gast (offline)")
-        self._show_tab("dashboard")
+        self._show_tab("menu")
         self.after(POLL_MS, self._poll_loop)
         self._schedule_auto_update()
 
@@ -249,6 +276,19 @@ class BusTrackerApp(ctk.CTk):
             except Exception:
                 pass
             self._live_job = None
+        if name == "spedition" and self._active_spedition_id:
+            self._refresh_members_async()
+            self._schedule_sped_auto()
+        elif self._sped_refresh_job:
+            try:
+                self.after_cancel(self._sped_refresh_job)
+            except Exception:
+                pass
+            self._sped_refresh_job = None
+        if name == "ranking" and self._active_spedition_id:
+            self._refresh_ranking_async()
+        if name == "bank":
+            self._refresh_bank_async()
 
     def _build_loading_tab(self):
         f = self.tabs["loading"]
@@ -259,17 +299,56 @@ class BusTrackerApp(ctk.CTk):
             "(kein WLAN nötig)\n\n"
             "The Bus Telemetrie startet automatisch mit dem Spiel.",
             font=ctk.CTkFont(size=15),
+            text_color=TEXT,
             justify="center",
         ).place(relx=0.5, rely=0.5, anchor="center")
+
+    def _build_menu_tab(self):
+        f = self.tabs["menu"]
+        f.grid_columnconfigure((0, 1, 2), weight=1)
+        f.grid_rowconfigure((0, 1, 2), weight=1)
+        ctk.CTkLabel(
+            f,
+            text="Hauptmenü",
+            font=ctk.CTkFont(size=24, weight="bold"),
+            text_color=TEXT,
+        ).grid(row=0, column=0, columnspan=3, padx=24, pady=(20, 8), sticky="w")
+
+        cards = [
+            ("Freie Fahrt", "Telemetrie & Umsatz", ACCENT_GREEN, "dashboard"),
+            ("Spedition", "Firma & Fahrer", ACCENT_YELLOW, "spedition"),
+            ("Live-Karte", "Berlin / Hamburg", ACCENT_BLUE, "live"),
+            ("Ranking", "Bestenliste", ACCENT_PURPLE, "ranking"),
+            ("Bankkonto", "Firma & Fahrer", ACCENT_ORANGE, "bank"),
+            ("Optionen", f"Version v{APP_VERSION}", "#8899aa", "account"),
+        ]
+        pos = [(1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)]
+        for (title, sub, col, tab), (r, c) in zip(cards, pos):
+            MenuCard(
+                f,
+                title=title,
+                subtitle=sub,
+                accent=col,
+                command=lambda t=tab: self._show_tab(t),
+            ).grid(row=r, column=c, padx=12, pady=10, sticky="nsew")
+
+        ctk.CTkButton(
+            f,
+            text="Update suchen",
+            fg_color=BG_CARD,
+            hover_color="#2a3548",
+            command=self._check_update_manual,
+        ).grid(row=3, column=2, padx=12, pady=8, sticky="e")
 
     def _build_dashboard_tab(self):
         f = self.tabs["dashboard"]
         f.grid_columnconfigure((0, 1), weight=1)
-        cards = ctk.CTkFrame(f)
+        cards = ctk.CTkFrame(f, fg_color="transparent")
         cards.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=16)
         for i in range(4):
             cards.grid_columnconfigure(i, weight=1)
         self.dash_cards = {}
+        accents = [ACCENT_GREEN, ACCENT_ORANGE, ACCENT_PURPLE, ACCENT_BLUE]
         for i, (title, key, default) in enumerate(
             [
                 ("Geschwindigkeit", "speed_val", "–"),
@@ -278,74 +357,185 @@ class BusTrackerApp(ctk.CTk):
                 ("Strecke", "dist_val", "0 km"),
             ]
         ):
-            card = ctk.CTkFrame(cards)
+            card = ctk.CTkFrame(cards, fg_color=BG_CARD, corner_radius=12)
             card.grid(row=0, column=i, padx=8, pady=8, sticky="nsew")
-            ctk.CTkLabel(card, text=title, text_color="gray").pack(pady=(12, 0))
-            lbl = ctk.CTkLabel(card, text=default, font=ctk.CTkFont(size=26, weight="bold"))
+            ctk.CTkLabel(card, text=title, text_color=accents[i]).pack(pady=(12, 0))
+            lbl = ctk.CTkLabel(
+                card, text=default, font=ctk.CTkFont(size=26, weight="bold"), text_color=TEXT
+            )
             lbl.pack(pady=12)
             self.dash_cards[key] = lbl
 
-        info = ctk.CTkFrame(f)
-        info.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=16, pady=8)
-        f.grid_rowconfigure(1, weight=1)
-        self.dash_info = ctk.CTkTextbox(info, height=220)
+        route_row = ctk.CTkFrame(f, fg_color="transparent")
+        route_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=4)
+        route_row.grid_columnconfigure((0, 1), weight=1)
+
+        line_card = ctk.CTkFrame(route_row, fg_color=BG_CARD, corner_radius=12)
+        line_card.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
+        ctk.CTkLabel(line_card, text="LINIE / ROUTE", text_color=ACCENT_YELLOW).pack(
+            anchor="w", padx=14, pady=(12, 0)
+        )
+        self.dash_line = ctk.CTkLabel(
+            line_card, text="–", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT, wraplength=420
+        )
+        self.dash_line.pack(anchor="w", padx=14, pady=(4, 12))
+
+        stop_card = ctk.CTkFrame(route_row, fg_color=BG_CARD, corner_radius=12)
+        stop_card.grid(row=0, column=1, padx=8, pady=8, sticky="nsew")
+        ctk.CTkLabel(stop_card, text="HALTESTELLE", text_color=ACCENT_BLUE).pack(
+            anchor="w", padx=14, pady=(12, 0)
+        )
+        self.dash_stop = ctk.CTkLabel(
+            stop_card, text="–", font=ctk.CTkFont(size=22, weight="bold"), text_color=TEXT, wraplength=420
+        )
+        self.dash_stop.pack(anchor="w", padx=14, pady=(4, 0))
+        self.dash_next_stop = ctk.CTkLabel(
+            stop_card, text="Nächste: –", text_color=TEXT_DIM, wraplength=420
+        )
+        self.dash_next_stop.pack(anchor="w", padx=14, pady=(2, 12))
+
+        pax_card = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=12)
+        pax_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=4)
+        ctk.CTkLabel(
+            pax_card,
+            text="FAHRGÄSTE",
+            text_color=ACCENT_PURPLE,
+        ).pack(side="left", padx=14, pady=10)
+        self.dash_passengers = ctk.CTkLabel(
+            pax_card, text="–", font=ctk.CTkFont(size=15), text_color=TEXT
+        )
+        self.dash_passengers.pack(side="left", padx=8, pady=10)
+        ctk.CTkLabel(
+            pax_card,
+            text="0/28 = belegte Sitze laut Spiel · oft immer 0 in der Beta",
+            text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=11),
+        ).pack(side="right", padx=14)
+
+        info = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=12)
+        info.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=16, pady=8)
+        f.grid_rowconfigure(3, weight=1)
+        self.dash_info = ctk.CTkTextbox(
+            info, height=120, fg_color="#0d1118", text_color=TEXT_DIM, font=ctk.CTkFont(size=12)
+        )
         self.dash_info.pack(fill="both", expand=True, padx=8, pady=8)
         self.dash_info.insert(
             "1.0",
-            "Warte auf The Bus…\n\n"
-            "Telemetrie in den Spieloptionen aktivieren (Port 37337).\n"
-            "Sobald du auf einer Route im Bus sitzt, startet das Tracking automatisch.\n",
+            "Warte auf The Bus…\n"
+            "Route im Spiel wählen (Betriebsplan) – dann erscheinen Linie & Haltestellen.\n",
         )
         ctk.CTkButton(f, text="Fahrt beenden", command=self._end_trip_manual).grid(
-            row=2, column=0, padx=16, pady=12, sticky="w"
+            row=4, column=0, padx=16, pady=12, sticky="w"
         )
 
     def _build_spedition_tab(self):
         f = self.tabs["spedition"]
-        f.grid_rowconfigure(2, weight=1)
-        row = ctk.CTkFrame(f)
+        f.grid_rowconfigure(3, weight=1)
+        f.grid_columnconfigure(0, weight=1)
+        row = ctk.CTkFrame(f, fg_color="transparent")
         row.grid(row=0, column=0, sticky="ew", padx=16, pady=12)
-        ctk.CTkLabel(row, text="Spedition", font=ctk.CTkFont(size=20, weight="bold")).pack(
-            side="left", padx=8
-        )
-        ctk.CTkButton(row, text="Aktualisieren", width=100, command=self._refresh_speditions).pack(
-            side="right", padx=8
-        )
-        if self._active_spedition_id:
-            self.after(500, self._update_stats, self._active_spedition_id)
-        create = ctk.CTkFrame(f)
+        ctk.CTkLabel(
+            row, text="Spedition", font=ctk.CTkFont(size=20, weight="bold"), text_color=ACCENT_YELLOW
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(
+            row, text="Aktualisieren", width=100, fg_color=BG_CARD, command=self._refresh_speditions
+        ).pack(side="right", padx=8)
+        create = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=10)
         create.grid(row=1, column=0, sticky="ew", padx=16, pady=4)
         self.sped_name = ctk.CTkEntry(create, placeholder_text="Name", width=180)
-        self.sped_name.pack(side="left", padx=4)
-        ctk.CTkButton(create, text="Gründen", command=self._create_spedition).pack(side="left", padx=8)
+        self.sped_name.pack(side="left", padx=8, pady=8)
+        ctk.CTkButton(
+            create,
+            text="Gründen",
+            fg_color=ACCENT_YELLOW,
+            text_color="#111",
+            command=self._create_spedition,
+        ).pack(side="left", padx=8)
         self.invite_entry = ctk.CTkEntry(create, placeholder_text="Einladungscode", width=160)
-        self.invite_entry.pack(side="right", padx=4)
-        ctk.CTkButton(create, text="Beitreten", command=self._join_spedition).pack(side="right", padx=4)
-        self.sped_list = ctk.CTkScrollableFrame(f)
-        self.sped_list.grid(row=2, column=0, sticky="nsew", padx=16, pady=8)
-        self.stats_label = ctk.CTkLabel(f, text="", justify="left")
-        self.stats_label.grid(row=3, column=0, sticky="ew", padx=24, pady=8)
+        self.invite_entry.pack(side="right", padx=8, pady=8)
+        ctk.CTkButton(create, text="Beitreten", command=self._join_spedition).pack(
+            side="right", padx=4
+        )
+        self.sped_list = ctk.CTkScrollableFrame(f, fg_color=BG_CARD)
+        self.sped_list.grid(row=2, column=0, sticky="ew", padx=16, pady=8, ipady=80)
+        self.stats_label = ctk.CTkLabel(f, text="", justify="left", text_color=TEXT_DIM)
+        self.stats_label.grid(row=3, column=0, sticky="ew", padx=24, pady=4)
+        ctk.CTkLabel(
+            f, text="Fahrer in deiner Spedition", font=ctk.CTkFont(size=14, weight="bold"), text_color=TEXT
+        ).grid(row=4, column=0, sticky="w", padx=24)
+        self.members_text = ctk.CTkTextbox(
+            f, height=200, fg_color="#0d1118", text_color=TEXT, font=ctk.CTkFont(size=12)
+        )
+        self.members_text.grid(row=5, column=0, sticky="nsew", padx=16, pady=8)
+        f.grid_rowconfigure(5, weight=1)
 
     def _build_live_tab(self):
         f = self.tabs["live"]
+        f.grid_rowconfigure(0, weight=1)
+        f.grid_columnconfigure(0, weight=1)
+        self.live_map = LiveMapCanvas(f)
+        self.live_map.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+
+    def _build_ranking_tab(self):
+        f = self.tabs["ranking"]
         f.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(
-            f, text="Live – Wer fährt wo?", font=ctk.CTkFont(size=18, weight="bold")
+            f, text="Ranking", font=ctk.CTkFont(size=20, weight="bold"), text_color=ACCENT_PURPLE
         ).pack(pady=12, anchor="w", padx=16)
-        self.live_text = ctk.CTkTextbox(f, height=400, font=ctk.CTkFont(size=13))
-        self.live_text.pack(fill="both", expand=True, padx=16, pady=8)
-        self.live_text.insert("1.0", "Wähle eine aktive Spedition (Tab Spedition → Aktiv).\n")
-        self.live_text.configure(state="disabled")
+        self.ranking_text = ctk.CTkTextbox(
+            f, fg_color="#0d1118", text_color=TEXT, font=ctk.CTkFont(family="Consolas", size=13)
+        )
+        self.ranking_text.pack(fill="both", expand=True, padx=16, pady=8)
+        ctk.CTkButton(f, text="Aktualisieren", command=self._refresh_ranking_async).pack(pady=8)
+
+    def _build_bank_tab(self):
+        f = self.tabs["bank"]
+        box = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=12)
+        box.pack(padx=24, pady=24, fill="x")
         ctk.CTkLabel(
-            f, text="Aktualisiert automatisch alle 5 Sekunden", text_color="gray"
-        ).pack(pady=(0, 4))
+            box, text="Bankkonto", font=ctk.CTkFont(size=20, weight="bold"), text_color=ACCENT_ORANGE
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+        self.lbl_driver_bank = ctk.CTkLabel(
+            box, text="Fahrer: –", font=ctk.CTkFont(size=22, weight="bold"), text_color=TEXT
+        )
+        self.lbl_driver_bank.pack(anchor="w", padx=16, pady=8)
+        self.lbl_sped_bank = ctk.CTkLabel(
+            box, text="Spedition: –", font=ctk.CTkFont(size=18), text_color=TEXT_DIM
+        )
+        self.lbl_sped_bank.pack(anchor="w", padx=16, pady=(0, 16))
+        ctk.CTkLabel(
+            box,
+            text="Umsatz aus Fahrten wird automatisch gutgeschrieben.\n"
+            "15 % der Fahrt-Einnahmen gehen auf das Speditionskonto.",
+            text_color=TEXT_DIM,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 16))
+        ctk.CTkButton(box, text="Konten aktualisieren", command=self._refresh_bank_async).pack(
+            padx=16, pady=(0, 16), anchor="w"
+        )
 
     def _build_account_tab(self):
         f = self.tabs["account"]
-        box = ctk.CTkFrame(f)
+        box = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=12)
         box.pack(padx=24, pady=24, fill="x")
-        ctk.CTkLabel(box, text="Konto (optional)", font=ctk.CTkFont(size=18, weight="bold")).pack(
-            anchor="w", pady=8
+        ctk.CTkLabel(
+            box,
+            text=f"Optionen  •  installierte Version v{APP_VERSION}",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=TEXT,
+        ).pack(anchor="w", padx=16, pady=12)
+        ctk.CTkLabel(
+            box,
+            text="Auto-Update: Sidebar → Update suchen\n"
+            "Neue EXE: build.ps1 → GitHub Release → publish_update.ps1",
+            text_color=TEXT_DIM,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=4)
+        ctk.CTkButton(
+            box, text="Update jetzt suchen", command=self._check_update_manual
+        ).pack(anchor="w", padx=16, pady=12)
+        ctk.CTkLabel(box, text="Konto (optional)", font=ctk.CTkFont(size=16, weight="bold")).pack(
+            anchor="w", padx=16, pady=8
         )
         ctk.CTkLabel(
             box,
@@ -484,9 +674,10 @@ class BusTrackerApp(ctk.CTk):
             self.config_data["active_spedition_id"] = s["id"]
             save_config(self.config_data)
             self._update_stats(s["id"])
+            self._refresh_members_async()
             self._toast(f"Aktiv: {s['name']}", "#2ECC71")
-            if self._current_tab == "live":
-                self._refresh_live_async()
+            if self._current_tab in ("live", "ranking", "bank"):
+                self._show_tab(self._current_tab)
 
         ctk.CTkButton(row, text="Aktiv", width=50, command=select).pack(side="right", padx=4)
 
@@ -521,6 +712,92 @@ class BusTrackerApp(ctk.CTk):
         except Exception:
             pass
 
+    def _schedule_sped_auto(self):
+        if self._sped_refresh_job:
+            try:
+                self.after_cancel(self._sped_refresh_job)
+            except Exception:
+                pass
+        if self._current_tab == "spedition" and self._active_spedition_id:
+            self._refresh_members_async()
+            self._sped_refresh_job = self.after(4000, self._schedule_sped_auto)
+
+    def _refresh_members_async(self):
+        if not self._active_spedition_id or not self.api:
+            self._set_members_text("Keine aktive Spedition.\nWähle oben eine Spedition → Aktiv.")
+            return
+
+        sid = self._active_spedition_id
+
+        def work():
+            return self.api.get_members(sid)
+
+        def ok(members):
+            lines = []
+            for m in members:
+                on = "🟢" if m.get("is_online") else "⚫"
+                lines.append(
+                    f"{on} #{m.get('rank', '?')} {m['display_name']} ({m.get('role', 'driver')})\n"
+                    f"   Konto: {m.get('balance_eur', 0):,.2f} €  |  "
+                    f"Umsatz: {m.get('total_revenue_eur', 0):,.2f} €  |  "
+                    f"{m.get('trip_count', 0)} Fahrten\n"
+                )
+            self._set_members_text("\n".join(lines) if lines else "Noch keine Fahrer.")
+
+        self._run_bg(work, on_ok=ok)
+
+    def _set_members_text(self, text: str):
+        self.members_text.delete("1.0", "end")
+        self.members_text.insert("1.0", text)
+
+    def _refresh_ranking_async(self):
+        if not self._active_spedition_id or not self.api:
+            self.ranking_text.delete("1.0", "end")
+            self.ranking_text.insert("1.0", "Keine aktive Spedition.")
+            return
+        sid = self._active_spedition_id
+
+        def work():
+            return self.api.get_ranking(sid)
+
+        def ok(rows):
+            lines = ["Rang  Fahrer              Umsatz      Fahrten  Strecke\n" + "-" * 55 + "\n"]
+            for r in rows:
+                lines.append(
+                    f"{r['rank']:3}  {r['display_name'][:18]:18}  "
+                    f"{r['total_revenue_eur']:>9,.2f} €  {r['trip_count']:>5}  "
+                    f"{r['total_distance_km']:>7.1f} km\n"
+                )
+            self.ranking_text.delete("1.0", "end")
+            self.ranking_text.insert("1.0", "".join(lines))
+
+        self._run_bg(work, on_ok=ok)
+
+    def _refresh_bank_async(self):
+        if not self.api:
+            return
+
+        def work():
+            driver = self.api.get_my_bank()
+            sped = None
+            if self._active_spedition_id:
+                sped = self.api.get_spedition_bank(self._active_spedition_id)
+            return driver, sped
+
+        def ok(data):
+            driver, sped = data
+            self.lbl_driver_bank.configure(
+                text=f"Fahrer ({driver.get('label', '')}): {driver.get('balance_eur', 0):,.2f} €"
+            )
+            if sped:
+                self.lbl_sped_bank.configure(
+                    text=f"Spedition ({sped.get('label', '')}): {sped.get('balance_eur', 0):,.2f} €"
+                )
+            else:
+                self.lbl_sped_bank.configure(text="Spedition: keine aktiv gewählt")
+
+        self._run_bg(work, on_ok=ok)
+
     def _schedule_live_auto(self):
         if self._live_job:
             try:
@@ -532,8 +809,8 @@ class BusTrackerApp(ctk.CTk):
 
     def _refresh_live_async(self):
         if self._live_busy or not self._active_spedition_id or not self.api:
-            if not self._active_spedition_id:
-                self._set_live_text("Keine aktive Spedition.\nTab Spedition → Aktiv wählen.")
+            if not self._active_spedition_id and hasattr(self, "live_map"):
+                self.live_map.set_drivers([], "Keine Spedition aktiv")
             return
         self._live_busy = True
         sid = self._active_spedition_id
@@ -543,30 +820,13 @@ class BusTrackerApp(ctk.CTk):
 
         def ok(drivers):
             self._live_busy = False
-            lines = []
-            if not drivers:
-                lines.append("Niemand online – warte auf Fahrer…")
-            for d in drivers:
-                flag = " ⚠" if d.get("is_overspeed") else ""
-                lines.append(
-                    f"{d['display_name']}  •  {d['speed_kmh']:.0f} km/h{flag}\n"
-                    f"  Karte: {d.get('level_name') or '–'} | Linie: {d.get('line_name') or '–'}\n"
-                    f"  {d.get('current_stop') or '–'} → {d.get('next_stop') or '–'}\n"
-                    f"  Umsatz: {d.get('revenue_session_eur', 0):.2f} €\n"
-                )
-            self._set_live_text("\n".join(lines))
+            self.live_map.set_drivers(drivers)
 
         def err(e):
             self._live_busy = False
-            self._set_live_text(format_api_error(e))
+            self.live_map.sub_lbl.configure(text=format_api_error(e)[:80])
 
         self._run_bg(work, on_ok=ok, on_err=err)
-
-    def _set_live_text(self, text: str):
-        self.live_text.configure(state="normal")
-        self.live_text.delete("1.0", "end")
-        self.live_text.insert("1.0", text)
-        self.live_text.configure(state="disabled")
 
     def _end_trip_manual(self):
         ended = self.tracker.force_end()
@@ -603,32 +863,59 @@ class BusTrackerApp(ctk.CTk):
                 map_name = "–"
 
             self.lbl_telemetry.configure(text=tel_text, text_color=tel_color)
-            self.lbl_game_map.configure(text=f"Karte: {map_name}")
+            line_hint = snap.line_name or snap.route_name
+            self.lbl_game_map.configure(
+                text=f"Karte: {map_name}" + (f"  |  {line_hint}" if line_hint else "")
+            )
 
             if snap.connected and self._tick_count % UI_REFRESH_EVERY == 0:
-                overspeed = (
-                    snap.allowed_speed_kmh > 0
-                    and snap.speed_kmh > snap.allowed_speed_kmh + 3
-                )
-                self.dash_cards["speed_val"].configure(
-                    text=f"{snap.speed_kmh:.0f} km/h",
-                    text_color="#FF6B6B" if overspeed else "white",
-                )
-                self.dash_cards["rev_val"].configure(
-                    text=f"{self.tracker.session_revenue:.2f} €"
-                )
-                self.dash_cards["tix_val"].configure(text=str(trip.tickets_sold))
-                self.dash_cards["dist_val"].configure(text=f"{trip.distance_km:.2f} km")
-                info = (
-                    f"Fahrzeug: {snap.vehicle_model}\n"
-                    f"Linie: {snap.line_name or '–'} | Route: {snap.route_name or '–'}\n"
-                    f"Karte: {snap.level_name or '–'}\n"
-                    f"Haltestelle: {snap.current_stop or '–'} → {snap.next_stop or '–'}\n"
-                    f"Belegung: {snap.num_occupied_seats}/{snap.num_seats}\n"
-                    f"Fahrt: {'aktiv' if trip.active else 'pausiert'} | Max {trip.max_speed_kmh:.0f} km/h\n"
-                )
-                self.dash_info.delete("1.0", "end")
-                self.dash_info.insert("1.0", info)
+                if self._current_tab == "dashboard":
+                    overspeed = (
+                        snap.allowed_speed_kmh > 0
+                        and snap.speed_kmh > snap.allowed_speed_kmh + 3
+                    )
+                    self.dash_cards["speed_val"].configure(
+                        text=f"{snap.speed_kmh:.0f} km/h",
+                        text_color="#FF6B6B" if overspeed else TEXT,
+                    )
+                    self.dash_cards["rev_val"].configure(
+                        text=f"{self.tracker.session_revenue:.2f} €"
+                    )
+                    self.dash_cards["tix_val"].configure(
+                        text=str(max(trip.tickets_sold, snap.tickets_session))
+                    )
+                    self.dash_cards["dist_val"].configure(text=f"{trip.distance_km:.2f} km")
+
+                    self.dash_line.configure(text=snap.line_display)
+                    self.dash_stop.configure(text=snap.stop_display)
+                    nxt = snap.next_stop or "–"
+                    self.dash_next_stop.configure(text=f"Nächste Haltestelle: {nxt}")
+                    seats = (
+                        f"Sitzplätze: {snap.num_occupied_seats}/{snap.num_seats}"
+                        if snap.num_seats
+                        else "Sitzplätze: –"
+                    )
+                    self.dash_passengers.configure(
+                        text=f"{snap.passengers_display}  |  {seats}  |  Tickets Session: {snap.tickets_session}"
+                    )
+
+                    info = (
+                        f"Fahrzeug: {snap.vehicle_model}\n"
+                        f"Karte: {snap.level_name or '–'}\n"
+                        f"Status: {'An Haltestelle' if snap.is_at_stop else 'Unterwegs'}"
+                        f"{' · Türen offen' if snap.passenger_doors_open else ''}\n"
+                        f"Fahrt: {'aktiv' if trip.active else 'pausiert'} | Max {trip.max_speed_kmh:.0f} km/h\n"
+                    )
+                    if not snap.line_name and not snap.current_stop:
+                        info += (
+                            "\nTipp: Im Spiel Route/Betriebsplan starten. "
+                            "Linie/Haltestelle kommen vom Bordcomputer (UMG/IBIS).\n"
+                            "Falls leer: tools\\probe_telemetry.py ausführen und uns die Button-Namen schicken.\n"
+                        )
+                    if info != self._cached_dash_info:
+                        self._cached_dash_info = info
+                        self.dash_info.delete("1.0", "end")
+                        self.dash_info.insert("1.0", info)
 
             if (
                 not trip.active
@@ -660,14 +947,16 @@ class BusTrackerApp(ctk.CTk):
                     "spedition_id": self._active_spedition_id,
                     "is_online": snap.connected,
                     "vehicle_model": snap.vehicle_model,
-                    "line_name": snap.line_name,
+                    "line_name": snap.line_name or snap.route_name,
                     "level_name": snap.level_name,
                     "current_stop": snap.current_stop,
                     "next_stop": snap.next_stop,
                     "speed_kmh": snap.speed_kmh,
                     "allowed_speed_kmh": snap.allowed_speed_kmh,
-                    "latitude": snap.location_y / 100000 if snap.location_y else 0,
-                    "longitude": snap.location_x / 100000 if snap.location_x else 0,
+                    "pos_x": snap.location_x,
+                    "pos_y": snap.location_y,
+                    "latitude": 0.0,
+                    "longitude": 0.0,
                     "revenue_session_eur": self.tracker.session_revenue,
                 }
             )
@@ -676,7 +965,7 @@ class BusTrackerApp(ctk.CTk):
 
     def destroy(self):
         self._running = False
-        for job in (self._live_job, self._update_job):
+        for job in (self._live_job, self._update_job, self._sped_refresh_job):
             if job:
                 try:
                     self.after_cancel(job)

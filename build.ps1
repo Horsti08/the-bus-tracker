@@ -5,7 +5,11 @@ Set-Location $Root
 
 python -m pip install -r requirements.txt -q
 
-Write-Host "Baue TheBusTracker.exe v1.1.0 ..."
+$ver = "?"
+if (Test-Path "$Root\shared\__init__.py") {
+    if ((Get-Content "$Root\shared\__init__.py" -Raw) -match 'APP_VERSION = "([^"]+)"') { $ver = $Matches[1] }
+}
+Write-Host "Baue TheBusTracker.exe v$ver ..."
 python -m PyInstaller `
     --noconfirm `
     --onefile `

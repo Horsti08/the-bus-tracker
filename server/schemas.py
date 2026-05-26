@@ -54,6 +54,8 @@ class LiveUpdateRequest(BaseModel):
     allowed_speed_kmh: float = 0.0
     latitude: float = 0.0
     longitude: float = 0.0
+    pos_x: float = 0.0
+    pos_y: float = 0.0
     revenue_session_eur: float = 0.0
 
 
@@ -70,7 +72,37 @@ class LiveDriverResponse(BaseModel):
     allowed_speed_kmh: float
     is_overspeed: bool
     revenue_session_eur: float
+    pos_x: float = 0.0
+    pos_y: float = 0.0
     updated_at: datetime
+
+
+class BankResponse(BaseModel):
+    balance_eur: float
+    account_type: str
+    label: str = ""
+
+
+class MemberResponse(BaseModel):
+    user_id: int
+    display_name: str
+    username: str
+    role: str
+    is_online: bool
+    balance_eur: float
+    total_revenue_eur: float
+    trip_count: int
+    rank: int = 0
+
+
+class RankingEntry(BaseModel):
+    rank: int
+    user_id: int
+    display_name: str
+    total_revenue_eur: float
+    trip_count: int
+    total_distance_km: float
+    balance_eur: float
 
 
 class TripSubmitRequest(BaseModel):

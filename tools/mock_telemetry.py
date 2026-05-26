@@ -22,8 +22,12 @@ def load_sample() -> dict:
         "NumSeats": 83,
         "Location": {"X": 165000, "Y": 76800, "Z": 4700},
         "BusLogic": {"Sales": {"TotalRevenue": 45.5, "TicketCount": 8}},
-        "Buttons": [],
-        "UMG": {},
+        "Buttons": [
+            {"Name": "IBIS_Line", "State": "245", "Value": ""},
+            {"Name": "Navigation_CurrentStop", "State": "Hauptbahnhof", "Value": ""},
+            {"Name": "Navigation_NextStop", "State": "Alexanderplatz", "Value": ""},
+        ],
+        "UMG": {"Atron": "/vehicles/Current/UMG/Atron"},
     }
 
 

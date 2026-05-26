@@ -8,14 +8,23 @@ from typing import Any
 
 import httpx
 
+from client.telemetry.route_info import (
+    RouteInfo,
+    collect_umg_paths,
+    extract_from_buttons,
+    extract_from_json,
+)
 from shared import DEFAULT_TELEMETRY_HOST, DEFAULT_TELEMETRY_PORT
+
+# Max. UMG-Subrequests pro Snapshot (Performance)
+_MAX_UMG_FETCHES = 10
 
 
 @dataclass
 class TelemetryConfig:
     host: str = DEFAULT_TELEMETRY_HOST
     port: int = DEFAULT_TELEMETRY_PORT
-    timeout: float = 0.5
+    timeout: float = 0.6
 
     @property
     def base_url(self) -> str:
@@ -48,6 +57,36 @@ class VehicleSnapshot:
     bus_logic_sales: dict[str, Any] = field(default_factory=dict)
     raw_buttons: list[dict[str, Any]] = field(default_factory=list)
     extra_paths: dict[str, str] = field(default_factory=dict)
+    route_sources: list[str] = field(default_factory=list)
+
+    @property
+    def passengers_display(self) -> str:
+        """Anzeige für Fahrgäste – Tickets oft zuverlässiger als Sitz-Sensor."""
+        if self.num_occupied_seats > 0:
+            return f"{self.num_occupied_seats} im Bus (Sitzplätze)"
+        if self.tickets_session > 0:
+            return f"ca. {self.tickets_session} (laut Ticketverkauf)"
+        return "keine erkannt"
+
+    @property
+    def line_display(self) -> str:
+        if self.line_name and self.route_name and self.route_name != self.line_name:
+            return f"Linie {self.line_name} · {self.route_name}"
+        if self.line_name:
+            return f"Linie {self.line_name}"
+        if self.route_name:
+            return self.route_name
+        return "– (Route im Spiel wählen / IBIS)"
+
+    @property
+    def stop_display(self) -> str:
+        if self.is_at_stop and self.current_stop:
+            return f"An Haltestelle: {self.current_stop}"
+        if self.is_at_stop:
+            return "An Haltestelle"
+        if self.current_stop:
+            return self.current_stop
+        return "–"
 
 
 def _bool_str(value: Any) -> bool:
@@ -60,6 +99,7 @@ class TelemetryClient:
     def __init__(self, config: TelemetryConfig | None = None):
         self.config = config or TelemetryConfig()
         self._client = httpx.Client(timeout=self.config.timeout)
+        self._umg_rotate = 0
 
     def close(self):
         self._client.close()
@@ -82,6 +122,7 @@ class TelemetryClient:
         snap = VehicleSnapshot()
         vehicle = self._get_json("vehicles/Current")
         world = self._get_json("world")
+        player = self._get_json("player")
 
         if vehicle is None:
             return snap
@@ -106,47 +147,57 @@ class TelemetryClient:
         if world:
             snap.level_name = world.get("LevelName", "")
 
+        route = RouteInfo()
+        route.merge(extract_from_json(vehicle, "vehicle"))
+
         umg = vehicle.get("UMG") or {}
-        for key, rel_path in umg.items():
-            if isinstance(rel_path, str):
-                snap.extra_paths[key] = rel_path
+        if isinstance(umg, dict):
+            for key, rel_path in umg.items():
+                if isinstance(rel_path, str):
+                    snap.extra_paths[key] = rel_path
 
         bus_logic = vehicle.get("BusLogic") or {}
         sales = bus_logic.get("Sales") or {}
         if isinstance(sales, dict):
             snap.bus_logic_sales = sales
             snap.revenue_eur = _extract_revenue_from_sales(sales)
-            snap.tickets_session = int(sales.get("TicketCount", sales.get("Tickets", 0)) or 0)
+            snap.tickets_session = int(
+                sales.get("TicketCount", sales.get("Tickets", sales.get("NumTickets", 0))) or 0
+            )
+        route.merge(extract_from_json(bus_logic, "BusLogic"))
 
         buttons = vehicle.get("Buttons") or []
         snap.raw_buttons = buttons if isinstance(buttons, list) else []
-        snap.line_name, snap.route_name, snap.current_stop, snap.next_stop = _parse_route_from_buttons(
-            snap.raw_buttons
-        )
+        route.merge(extract_from_buttons(snap.raw_buttons))
 
-        if "Atron" in snap.extra_paths:
-            atron = self._get_json(snap.extra_paths["Atron"].lstrip("/"))
-            if isinstance(atron, dict):
-                snap.line_name = snap.line_name or str(atron.get("Line", atron.get("LineName", "")))
-                snap.route_name = snap.route_name or str(atron.get("Route", atron.get("RouteName", "")))
-                snap.current_stop = snap.current_stop or str(
-                    atron.get("CurrentStop", atron.get("Stop", ""))
-                )
-                snap.next_stop = snap.next_stop or str(atron.get("NextStop", ""))
-                atron_sales = atron.get("Sales") or atron.get("BusLogic", {}).get("Sales")
-                if isinstance(atron_sales, dict):
-                    snap.bus_logic_sales = {**snap.bus_logic_sales, **atron_sales}
-                    snap.revenue_eur = max(snap.revenue_eur, _extract_revenue_from_sales(atron_sales))
+        # UMG-Unterseiten (Atron, Navigation, IBIS, …)
+        paths = collect_umg_paths(vehicle)
+        if paths:
+            start = self._umg_rotate % max(len(paths), 1)
+            self._umg_rotate += _MAX_UMG_FETCHES
+            batch = []
+            for i in range(_MAX_UMG_FETCHES):
+                batch.append(paths[(start + i) % len(paths)])
+            for path in batch:
+                sub = self._get_json(path.lstrip("/"))
+                if isinstance(sub, dict):
+                    route.merge(extract_from_json(sub, path))
+                    nested_umg = sub.get("UMG")
+                    if isinstance(nested_umg, dict):
+                        for nk, np in nested_umg.items():
+                            if isinstance(np, str):
+                                sub2 = self._get_json(np.lstrip("/"))
+                                if isinstance(sub2, dict):
+                                    route.merge(extract_from_json(sub2, f"{path}/{nk}"))
 
-        if "Navigation" in snap.extra_paths:
-            nav = self._get_json(snap.extra_paths["Navigation"].lstrip("/"))
-            if isinstance(nav, dict):
-                snap.line_name = snap.line_name or str(nav.get("Line", nav.get("LineName", "")))
-                snap.route_name = snap.route_name or str(nav.get("Route", nav.get("RouteName", "")))
-                snap.current_stop = snap.current_stop or str(
-                    nav.get("CurrentStop", nav.get("StopName", ""))
-                )
-                snap.next_stop = snap.next_stop or str(nav.get("NextStop", ""))
+        if player and isinstance(player, dict):
+            route.merge(extract_from_json(player, "player"))
+
+        snap.line_name = route.line_name
+        snap.route_name = route.route_name
+        snap.current_stop = route.current_stop
+        snap.next_stop = route.next_stop
+        snap.route_sources = route.sources
 
         return snap
 
@@ -167,22 +218,3 @@ def _extract_revenue_from_sales(sales: dict[str, Any]) -> float:
         except (TypeError, ValueError):
             pass
     return total
-
-
-def _parse_route_from_buttons(buttons: list[dict[str, Any]]) -> tuple[str, str, str, str]:
-    line, route, current, nxt = "", "", "", ""
-    for btn in buttons:
-        name = str(btn.get("Name", ""))
-        state = str(btn.get("State", ""))
-        value = str(btn.get("Value", ""))
-        lower = name.lower()
-        if "line" in lower and state and state not in ("Primary", "false", "None"):
-            line = state if not line else line
-        if "route" in lower and state and state not in ("Primary", "false"):
-            route = state
-        if "stop" in lower or "haltestelle" in lower:
-            if "next" in lower:
-                nxt = value or state
-            elif "current" in lower or "aktuelle" in lower:
-                current = value or state
-    return line, route, current, nxt

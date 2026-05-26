@@ -26,6 +26,9 @@ class User(Base):
 
     memberships: Mapped[list["SpeditionMember"]] = relationship(back_populates="user")
     trips: Mapped[list["Trip"]] = relationship(back_populates="user")
+    bank_account: Mapped["BankAccount | None"] = relationship(
+        back_populates="user", uselist=False, foreign_keys="BankAccount.user_id"
+    )
 
 
 class Spedition(Base):
@@ -43,6 +46,9 @@ class Spedition(Base):
         back_populates="spedition", cascade="all, delete-orphan"
     )
     trips: Mapped[list["Trip"]] = relationship(back_populates="spedition")
+    bank_account: Mapped["BankAccount | None"] = relationship(
+        back_populates="spedition", uselist=False, foreign_keys="BankAccount.spedition_id"
+    )
 
 
 class SpeditionMember(Base):
@@ -99,5 +105,28 @@ class LiveStatus(Base):
     allowed_speed_kmh: Mapped[float] = mapped_column(Float, default=0.0)
     latitude: Mapped[float] = mapped_column(Float, default=0.0)
     longitude: Mapped[float] = mapped_column(Float, default=0.0)
+    pos_x: Mapped[float] = mapped_column(Float, default=0.0)
+    pos_y: Mapped[float] = mapped_column(Float, default=0.0)
     revenue_session_eur: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class BankAccount(Base):
+    __tablename__ = "bank_accounts"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_bank_user"),
+        UniqueConstraint("spedition_id", name="uq_bank_spedition"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    spedition_id: Mapped[int | None] = mapped_column(ForeignKey("speditions.id"), nullable=True)
+    balance_eur: Mapped[float] = mapped_column(Float, default=5000.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    user: Mapped["User | None"] = relationship(
+        back_populates="bank_account", foreign_keys=[user_id]
+    )
+    spedition: Mapped["Spedition | None"] = relationship(
+        back_populates="bank_account", foreign_keys=[spedition_id]
+    )

@@ -35,6 +35,8 @@ def init_db():
     with engine.begin() as conn:
         for stmt in (
             "ALTER TABLE live_status ADD COLUMN level_name VARCHAR(128) DEFAULT ''",
+            "ALTER TABLE live_status ADD COLUMN pos_x FLOAT DEFAULT 0",
+            "ALTER TABLE live_status ADD COLUMN pos_y FLOAT DEFAULT 0",
         ):
             try:
                 conn.execute(text(stmt))

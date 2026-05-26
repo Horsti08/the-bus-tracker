@@ -12,11 +12,19 @@ from server import models
 from server.auth import create_access_token, decode_token, hash_password, verify_password
 from server.database import get_db, init_db
 from shared import APP_VERSION, COMMUNITY_SERVER_NAME
+from server.bank_service import (
+    credit_trip_revenue,
+    ensure_spedition_bank,
+    ensure_user_bank,
+)
 from server.schemas import (
+    BankResponse,
     JoinSpeditionRequest,
     LiveDriverResponse,
     LiveUpdateRequest,
     LoginRequest,
+    MemberResponse,
+    RankingEntry,
     RegisterRequest,
     SpeditionCreate,
     SpeditionResponse,
@@ -147,6 +155,8 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
         display_name=body.display_name or body.username,
     )
     db.add(user)
+    db.flush()
+    ensure_user_bank(db, user.id)
     db.commit()
     db.refresh(user)
     token = create_access_token(user.id, user.username)
@@ -194,6 +204,8 @@ def create_spedition(
     db.add(sp)
     db.flush()
     db.add(models.SpeditionMember(spedition_id=sp.id, user_id=user.id, role="owner"))
+    ensure_spedition_bank(db, sp.id)
+    ensure_user_bank(db, user.id)
     db.commit()
     db.refresh(sp)
     return SpeditionResponse(
@@ -268,6 +280,7 @@ def join_spedition(
     )
     if not existing:
         db.add(models.SpeditionMember(spedition_id=sp.id, user_id=user.id, role="driver"))
+        ensure_user_bank(db, user.id)
         db.commit()
     count = db.query(models.SpeditionMember).filter(models.SpeditionMember.spedition_id == sp.id).count()
     return SpeditionResponse(
@@ -351,6 +364,8 @@ def update_live(
     status.allowed_speed_kmh = body.allowed_speed_kmh
     status.latitude = body.latitude
     status.longitude = body.longitude
+    status.pos_x = body.pos_x
+    status.pos_y = body.pos_y
     status.revenue_session_eur = body.revenue_session_eur
     status.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -404,10 +419,148 @@ def get_live_drivers(
                 allowed_speed_kmh=status.allowed_speed_kmh,
                 is_overspeed=overspeed,
                 revenue_session_eur=status.revenue_session_eur,
+                pos_x=status.pos_x,
+                pos_y=status.pos_y,
                 updated_at=status.updated_at,
             )
         )
     return drivers
+
+
+@app.get("/users/me/bank", response_model=BankResponse)
+def my_bank(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    acc = ensure_user_bank(db, user.id)
+    db.commit()
+    return BankResponse(
+        balance_eur=round(acc.balance_eur, 2),
+        account_type="driver",
+        label=user.display_name,
+    )
+
+
+@app.get("/speditions/{spedition_id}/bank", response_model=BankResponse)
+def spedition_bank(
+    spedition_id: int,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _is_member(db, spedition_id, user.id):
+        raise HTTPException(403, "Kein Mitglied")
+    sp = db.get(models.Spedition, spedition_id)
+    acc = ensure_spedition_bank(db, spedition_id)
+    db.commit()
+    return BankResponse(
+        balance_eur=round(acc.balance_eur, 2),
+        account_type="spedition",
+        label=sp.name if sp else "",
+    )
+
+
+def _is_member(db: Session, spedition_id: int, user_id: int) -> bool:
+    return (
+        db.query(models.SpeditionMember)
+        .filter(
+            models.SpeditionMember.spedition_id == spedition_id,
+            models.SpeditionMember.user_id == user_id,
+        )
+        .first()
+        is not None
+    )
+
+
+@app.get("/speditions/{spedition_id}/members", response_model=list[MemberResponse])
+def spedition_members(
+    spedition_id: int,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _is_member(db, spedition_id, user.id):
+        raise HTTPException(403, "Kein Mitglied")
+
+    members = (
+        db.query(models.SpeditionMember, models.User)
+        .join(models.User, models.User.id == models.SpeditionMember.user_id)
+        .filter(models.SpeditionMember.spedition_id == spedition_id)
+        .all()
+    )
+    result: list[MemberResponse] = []
+    for m, u in members:
+        agg = (
+            db.query(
+                func.coalesce(func.sum(models.Trip.revenue_eur), 0.0),
+                func.count(models.Trip.id),
+            )
+            .filter(
+                models.Trip.user_id == u.id,
+                models.Trip.spedition_id == spedition_id,
+            )
+            .one()
+        )
+        acc = ensure_user_bank(db, u.id)
+        live = db.query(models.LiveStatus).filter(models.LiveStatus.user_id == u.id).first()
+        online = bool(live and live.is_online and live.spedition_id == spedition_id)
+        result.append(
+            MemberResponse(
+                user_id=u.id,
+                display_name=u.display_name,
+                username=u.username,
+                role=m.role,
+                is_online=online,
+                balance_eur=round(acc.balance_eur, 2),
+                total_revenue_eur=round(float(agg[0]), 2),
+                trip_count=int(agg[1]),
+            )
+        )
+    result.sort(key=lambda x: x.total_revenue_eur, reverse=True)
+    ranked = [m.model_copy(update={"rank": i}) for i, m in enumerate(result, 1)]
+    db.commit()
+    return ranked
+
+
+@app.get("/speditions/{spedition_id}/ranking", response_model=list[RankingEntry])
+def spedition_ranking(
+    spedition_id: int,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _is_member(db, spedition_id, user.id):
+        raise HTTPException(403, "Kein Mitglied")
+
+    rows = (
+        db.query(
+            models.User.id,
+            models.User.display_name,
+            func.coalesce(func.sum(models.Trip.revenue_eur), 0.0),
+            func.count(models.Trip.id),
+            func.coalesce(func.sum(models.Trip.distance_km), 0.0),
+        )
+        .join(models.SpeditionMember, models.SpeditionMember.user_id == models.User.id)
+        .outerjoin(
+            models.Trip,
+            (models.Trip.user_id == models.User.id)
+            & (models.Trip.spedition_id == spedition_id),
+        )
+        .filter(models.SpeditionMember.spedition_id == spedition_id)
+        .group_by(models.User.id, models.User.display_name)
+        .order_by(func.coalesce(func.sum(models.Trip.revenue_eur), 0.0).desc())
+        .all()
+    )
+    ranking: list[RankingEntry] = []
+    for i, (uid, name, rev, trips, dist) in enumerate(rows, 1):
+        acc = ensure_user_bank(db, uid)
+        ranking.append(
+            RankingEntry(
+                rank=i,
+                user_id=uid,
+                display_name=name,
+                total_revenue_eur=round(float(rev), 2),
+                trip_count=int(trips),
+                total_distance_km=round(float(dist), 2),
+                balance_eur=round(acc.balance_eur, 2),
+            )
+        )
+    db.commit()
+    return ranking
 
 
 @app.post("/trips", response_model=TripResponse)
@@ -434,6 +587,8 @@ def submit_trip(
         overspeed_events=body.overspeed_events,
     )
     db.add(trip)
+    db.flush()
+    credit_trip_revenue(db, user.id, body.spedition_id, body.revenue_eur)
     db.commit()
     db.refresh(trip)
     return TripResponse(

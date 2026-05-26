@@ -172,3 +172,32 @@ class ApiClient:
         except httpx.HTTPError:
             pass
         return None
+
+    def get_my_bank(self) -> dict:
+        r = self._client.get(self._url("/users/me/bank"), headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def get_spedition_bank(self, spedition_id: int) -> dict:
+        r = self._client.get(
+            self._url(f"/speditions/{spedition_id}/bank"),
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_members(self, spedition_id: int) -> list[dict]:
+        r = self._client.get(
+            self._url(f"/speditions/{spedition_id}/members"),
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_ranking(self, spedition_id: int) -> list[dict]:
+        r = self._client.get(
+            self._url(f"/speditions/{spedition_id}/ranking"),
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+        return r.json()
